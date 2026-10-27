@@ -1,7 +1,7 @@
 # Lighthouse: three Go services plus a full OpenTelemetry/Grafana stack.
 #   docker compose up -d --build --wait
 #   open http://localhost:3000  (Grafana, anonymous viewer)
-# Image versions and digests are recorded in versions.env and docs/versions.md.
+# Every image is pinned by digest; the full list is in docs/versions.md.
 name: lighthouse
 
 x-hardening: &hardening
