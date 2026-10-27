@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default; jobs widen only what they need.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GO_VERSION: "1.27.3"
+  GOVULNCHECK_VERSION: v1.9.0
+  COVERAGE_MIN: "80"
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+  ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+  PROMETHEUS_IMAGE: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+  ALERTMANAGER_IMAGE: prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+  COLLECTOR_IMAGE: otel/opentelemetry-collector-contrib:0.162.0@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6
+
+jobs:
+  go:
+    name: Go (vet, race tests, coverage, govulncheck)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: go vet
+        run: go vet ./...
+      - name: go test (race, coverage)
+        run: go test -race -count=1 -covermode=atomic -coverpkg=./internal/... -coverprofile=coverage.out ./...
+      - name: Coverage gate
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ { sub("%", "", $3); print $3 }')
+          echo "Total coverage: ${total}% (minimum ${COVERAGE_MIN}%)" | tee -a "$GITHUB_STEP_SUMMARY"
+          awk -v t="$total" -v m="$COVERAGE_MIN" 'BEGIN { exit !(t >= m) }'
+      - name: govulncheck
+        run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 14
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+
+  config:
+    name: Config validation (rules, alerts, collector, dashboards, Dockerfile, shell, workflows)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: promtool check config + rules
+        run: |
+          docker run --rm -v "$PWD/observability/prometheus:/etc/prometheus:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" \
+            check config /etc/prometheus/prometheus.yml
+          docker run --rm -v "$PWD/observability/prometheus:/etc/prometheus:ro" --entrypoint promtool "$PROMETHEUS_IMAGE" \
+            check rules /etc/prometheus/rules/slo-gateway.yml
+      - name: promtool test rules (SLO burn-rate unit tests)
+        run: |
+          docker run --rm -v "$PWD/observability/prometheus:/etc/prometheus:ro" -w /etc/prometheus/tests \
+            --entrypoint promtool "$PROMETHEUS_IMAGE" test rules slo-gateway.test.yml
+      - name: amtool check-config
+        run: |
+          docker run --rm -v "$PWD/observability/alertmanager:/etc/alertmanager:ro" --entrypoint amtool "$ALERTMANAGER_IMAGE" \
+            check-config /etc/alertmanager/alertmanager.yml
+      - name: otelcol validate
+        run: |
+          docker run --rm -v "$PWD/observability/otel-collector:/etc/otelcol:ro" "$COLLECTOR_IMAGE" \
+            validate --config=/etc/otelcol/config.yaml
+      - name: Dashboards are valid JSON with unique UIDs
+        run: |
+          for f in observability/grafana/dashboards/*.json; do jq -e '.uid and .title and (.panels | length > 0)' "$f" >/dev/null; done
+          dupes=$(jq -r '.uid' observability/grafana/dashboards/*.json | sort | uniq -d)
+          test -z "$dupes" || { echo "duplicate dashboard uid: $dupes"; exit 1; }
+      - name: docker compose config
+        run: docker compose config --quiet
+      - name: hadolint
+        run: docker run --rm -i "$HADOLINT_IMAGE" hadolint --failure-threshold warning - < Dockerfile
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE" -color
+
+  secrets:
+    name: Gitleaks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Gitleaks (full history)
+        id: gitleaks
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" "$GITLEAKS_IMAGE" \
+            git /repo --redact --exit-code 1 --report-format sarif --report-path /repo/gitleaks.sarif
+      - name: Upload SARIF
+        if: always() && steps.gitleaks.outcome != 'skipped'
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  e2e:
+    name: End-to-end (stack, k6 baseline, chaos -> alert)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GRAFANA_ADMIN_PASSWORD: ci-only-admin
+      RESULTS_DIR: loadtest/results
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build service images
+        run: docker compose build
+      - name: Start stack
+        run: docker compose up -d --wait --wait-timeout 240
+      - name: Wait for every component
+        run: scripts/wait-for-stack.sh
+      - name: k6 baseline (thresholds = SLOs)
+        run: |
+          mkdir -p "$RESULTS_DIR" && chmod 0777 "$RESULTS_DIR"
+          docker compose run --rm -e RATE=15 -e DURATION=2m k6 run --quiet /scripts/baseline.js
+      - name: Verify metrics, exemplars, traces, logs and dashboards
+        run: scripts/verify-telemetry.sh
+      - name: Chaos run must fire the fast-burn alert
+        run: scripts/chaos-assert.sh
+      - name: Report
+        if: always()
+        run: scripts/report.sh
+      - name: Collect logs
+        if: always()
+        run: docker compose logs --no-color --timestamps > "$RESULTS_DIR/compose.log" 2>&1 || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: e2e-results
+          path: loadtest/results/
+          retention-days: 30
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans

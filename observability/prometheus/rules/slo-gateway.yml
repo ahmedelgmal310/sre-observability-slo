@@ -1,0 +1,195 @@
+# Gateway SLOs (see docs/slo.md for the reasoning behind each number).
+#
+#   availability: 99.5% of requests are not 5xx, over 30 days  -> budget 0.5%
+#   latency:      95%   of requests complete in < 300ms, 30 days -> budget 5%
+#
+# Alerting follows the multi-window, multi-burn-rate pattern from the Google
+# SRE Workbook (chapter 5). A burn rate of 1 spends exactly the budget over the
+# 30d window.
+#   fast burn: 14.4x over 1h, confirmed over 5m  -> 2% of budget in 1h  (page)
+#   slow burn:  6x   over 6h, confirmed over 30m -> 5% of budget in 6h  (page)
+# The short window makes the alert reset quickly once the problem is fixed.
+groups:
+  - name: slo-gateway-sli
+    interval: 15s
+    rules:
+      # ---- objectives -------------------------------------------------------
+      - record: slo:objective:ratio
+        labels: {service: gateway, slo: availability}
+        expr: vector(0.995)
+      - record: slo:objective:ratio
+        labels: {service: gateway, slo: latency}
+        expr: vector(0.95)
+      - record: slo:error_budget:ratio
+        labels: {service: gateway, slo: availability}
+        expr: vector(1 - 0.995)
+      - record: slo:error_budget:ratio
+        labels: {service: gateway, slo: latency}
+        expr: vector(1 - 0.95)
+
+      # ---- availability SLI: fraction of requests answered with 5xx --------
+      - record: slo:sli_error:ratio_rate5m
+        labels: {service: gateway, slo: availability}
+        expr: |
+          (sum(rate(http_server_request_duration_seconds_count{job="gateway", http_response_status_code=~"5.."}[5m])) or vector(0))
+          /
+          sum(rate(http_server_request_duration_seconds_count{job="gateway"}[5m]))
+      - record: slo:sli_error:ratio_rate30m
+        labels: {service: gateway, slo: availability}
+        expr: |
+          (sum(rate(http_server_request_duration_seconds_count{job="gateway", http_response_status_code=~"5.."}[30m])) or vector(0))
+          /
+          sum(rate(http_server_request_duration_seconds_count{job="gateway"}[30m]))
+      - record: slo:sli_error:ratio_rate1h
+        labels: {service: gateway, slo: availability}
+        expr: |
+          (sum(rate(http_server_request_duration_seconds_count{job="gateway", http_response_status_code=~"5.."}[1h])) or vector(0))
+          /
+          sum(rate(http_server_request_duration_seconds_count{job="gateway"}[1h]))
+      - record: slo:sli_error:ratio_rate6h
+        labels: {service: gateway, slo: availability}
+        expr: |
+          (sum(rate(http_server_request_duration_seconds_count{job="gateway", http_response_status_code=~"5.."}[6h])) or vector(0))
+          /
+          sum(rate(http_server_request_duration_seconds_count{job="gateway"}[6h]))
+      - record: slo:sli_error:ratio_rate30d
+        labels: {service: gateway, slo: availability}
+        expr: |
+          (sum(rate(http_server_request_duration_seconds_count{job="gateway", http_response_status_code=~"5.."}[30d])) or vector(0))
+          /
+          sum(rate(http_server_request_duration_seconds_count{job="gateway"}[30d]))
+
+      # ---- latency SLI: fraction of requests slower than 300ms -------------
+      - record: slo:sli_error:ratio_rate5m
+        labels: {service: gateway, slo: latency}
+        expr: |
+          1 - (
+            sum(rate(http_server_request_duration_seconds_bucket{job="gateway", le="0.3"}[5m]))
+            /
+            sum(rate(http_server_request_duration_seconds_count{job="gateway"}[5m]))
+          )
+      - record: slo:sli_error:ratio_rate30m
+        labels: {service: gateway, slo: latency}
+        expr: |
+          1 - (
+            sum(rate(http_server_request_duration_seconds_bucket{job="gateway", le="0.3"}[30m]))
+            /
+            sum(rate(http_server_request_duration_seconds_count{job="gateway"}[30m]))
+          )
+      - record: slo:sli_error:ratio_rate1h
+        labels: {service: gateway, slo: latency}
+        expr: |
+          1 - (
+            sum(rate(http_server_request_duration_seconds_bucket{job="gateway", le="0.3"}[1h]))
+            /
+            sum(rate(http_server_request_duration_seconds_count{job="gateway"}[1h]))
+          )
+      - record: slo:sli_error:ratio_rate6h
+        labels: {service: gateway, slo: latency}
+        expr: |
+          1 - (
+            sum(rate(http_server_request_duration_seconds_bucket{job="gateway", le="0.3"}[6h]))
+            /
+            sum(rate(http_server_request_duration_seconds_count{job="gateway"}[6h]))
+          )
+      - record: slo:sli_error:ratio_rate30d
+        labels: {service: gateway, slo: latency}
+        expr: |
+          1 - (
+            sum(rate(http_server_request_duration_seconds_bucket{job="gateway", le="0.3"}[30d]))
+            /
+            sum(rate(http_server_request_duration_seconds_count{job="gateway"}[30d]))
+          )
+
+      # ---- error budget ----------------------------------------------------
+      # 1 = untouched, 0 = exhausted, negative = SLO violated for the window.
+      - record: slo:error_budget_remaining:ratio
+        expr: 1 - (slo:sli_error:ratio_rate30d / on(service, slo) slo:error_budget:ratio)
+      # Current burn rate over the last hour (1 = on track to spend 100%).
+      - record: slo:burn_rate:ratio_rate1h
+        expr: slo:sli_error:ratio_rate1h / on(service, slo) slo:error_budget:ratio
+
+  - name: slo-gateway-alerts
+    interval: 15s
+    rules:
+      - alert: GatewayAvailabilityFastBurn
+        expr: |
+          slo:sli_error:ratio_rate1h{service="gateway", slo="availability"} > (14.4 * 0.005)
+          and
+          slo:sli_error:ratio_rate5m{service="gateway", slo="availability"} > (14.4 * 0.005)
+        for: 1m
+        labels:
+          severity: page
+          window: 1h/5m
+        annotations:
+          summary: Gateway is burning its availability error budget 14.4x too fast
+          description: >-
+            {{ $value | humanizePercentage }} of gateway requests failed with 5xx over the last
+            hour (objective 99.5%). At this rate 2% of the 30-day budget is gone every hour.
+          runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/gateway-availability.md
+          dashboard: http://localhost:3000/d/lighthouse-slo
+
+      - alert: GatewayAvailabilitySlowBurn
+        expr: |
+          slo:sli_error:ratio_rate6h{service="gateway", slo="availability"} > (6 * 0.005)
+          and
+          slo:sli_error:ratio_rate30m{service="gateway", slo="availability"} > (6 * 0.005)
+        for: 5m
+        labels:
+          severity: page
+          window: 6h/30m
+        annotations:
+          summary: Gateway is burning its availability error budget 6x too fast
+          description: >-
+            {{ $value | humanizePercentage }} of gateway requests failed with 5xx over the last
+            6 hours (objective 99.5%). At this rate 5% of the 30-day budget is gone every 6 hours.
+          runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/gateway-availability.md
+          dashboard: http://localhost:3000/d/lighthouse-slo
+
+      - alert: GatewayLatencyFastBurn
+        expr: |
+          slo:sli_error:ratio_rate1h{service="gateway", slo="latency"} > (14.4 * 0.05)
+          and
+          slo:sli_error:ratio_rate5m{service="gateway", slo="latency"} > (14.4 * 0.05)
+        for: 1m
+        labels:
+          severity: page
+          window: 1h/5m
+        annotations:
+          summary: Gateway is burning its latency error budget 14.4x too fast
+          description: >-
+            {{ $value | humanizePercentage }} of gateway requests took longer than 300ms over the
+            last hour (objective: 95% under 300ms).
+          runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/gateway-latency.md
+          dashboard: http://localhost:3000/d/lighthouse-slo
+
+      - alert: GatewayLatencySlowBurn
+        expr: |
+          slo:sli_error:ratio_rate6h{service="gateway", slo="latency"} > (6 * 0.05)
+          and
+          slo:sli_error:ratio_rate30m{service="gateway", slo="latency"} > (6 * 0.05)
+        for: 5m
+        labels:
+          severity: page
+          window: 6h/30m
+        annotations:
+          summary: Gateway is burning its latency error budget 6x too fast
+          description: >-
+            {{ $value | humanizePercentage }} of gateway requests took longer than 300ms over the
+            last 6 hours (objective: 95% under 300ms).
+          runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/gateway-latency.md
+          dashboard: http://localhost:3000/d/lighthouse-slo
+
+  - name: telemetry-pipeline
+    rules:
+      - alert: TelemetryPipelineDown
+        expr: up{job="otel-collector"} == 0
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Prometheus cannot scrape the OpenTelemetry Collector
+          description: >-
+            SLO alerts are blind while service metrics are not flowing. Burn-rate alerts
+            cannot fire during this outage.
+          runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/telemetry-pipeline.md

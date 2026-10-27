@@ -1,0 +1,23 @@
+# Routing tree. Receivers are intentionally inert in this demo stack; in a real
+# deployment "page" would be PagerDuty/Opsgenie and "ticket" a chat channel or
+# issue tracker integration.
+route:
+  receiver: ticket
+  group_by: [alertname, slo]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="page"']
+      receiver: page
+      group_wait: 0s
+
+inhibit_rules:
+  # A fast burn already pages; do not also page for the slow burn of the same SLO.
+  - source_matchers: ['alertname=~".*FastBurn"']
+    target_matchers: ['alertname=~".*SlowBurn"']
+    equal: [slo]
+
+receivers:
+  - name: page
+  - name: ticket

@@ -1,0 +1,152 @@
+# Lighthouse: three Go services plus a full OpenTelemetry/Grafana stack.
+#   docker compose up -d --build --wait
+#   open http://localhost:3000  (Grafana, anonymous viewer)
+# Image versions and digests are recorded in versions.env and docs/versions.md.
+name: lighthouse
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
+x-service-env: &service-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_METRIC_EXPORT_INTERVAL: "5000"
+  # Lets clients inject faults through W3C baggage. Demo/test environments only.
+  CHAOS_ENABLED: "true"
+  LOG_LEVEL: info
+
+x-service-health: &service-health
+  test: ["CMD", "/service", "-healthcheck"]
+  interval: 5s
+  timeout: 3s
+  start_period: 5s
+  retries: 10
+
+services:
+  gateway:
+    <<: *hardening
+    image: lighthouse/gateway:local
+    build: {context: ., args: {SERVICE: gateway}}
+    environment:
+      <<: *service-env
+      ORDERS_URL: http://orders:8080
+    ports: ["127.0.0.1:8080:8080"]
+    healthcheck: *service-health
+    depends_on:
+      orders: {condition: service_healthy}
+      otel-collector: {condition: service_started}
+
+  orders:
+    <<: *hardening
+    image: lighthouse/orders:local
+    build: {context: ., args: {SERVICE: orders}}
+    environment:
+      <<: *service-env
+      INVENTORY_URL: http://inventory:8080
+    healthcheck: *service-health
+    depends_on:
+      inventory: {condition: service_healthy}
+      otel-collector: {condition: service_started}
+
+  inventory:
+    <<: *hardening
+    image: lighthouse/inventory:local
+    build: {context: ., args: {SERVICE: inventory}}
+    environment:
+      <<: *service-env
+    healthcheck: *service-health
+    depends_on:
+      otel-collector: {condition: service_started}
+
+  otel-collector:
+    <<: *hardening
+    image: otel/opentelemetry-collector-contrib:0.162.0@sha256:39923a8e431bd1f57be82411999d389fcfe40857492e4365456d97a4c1f74be6
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    ports: ["127.0.0.1:4318:4318"]
+    depends_on: [tempo, loki]
+
+  prometheus:
+    <<: *hardening
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+      - --enable-feature=exemplar-storage
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
+    tmpfs: ["/prometheus:mode=1777"]
+    ports: ["127.0.0.1:9090:9090"]
+
+  alertmanager:
+    <<: *hardening
+    image: prom/alertmanager:v0.34.1@sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    tmpfs: ["/alertmanager:mode=1777"]
+    ports: ["127.0.0.1:9093:9093"]
+
+  tempo:
+    image: grafana/tempo:2.10.8@sha256:f0561deb1c68ec44d6e6e7e4487f30106c4e5e768642077695b37958b105812a
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+    tmpfs: ["/var/tempo:mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    ports: ["127.0.0.1:3200:3200"]
+
+  loki:
+    image: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./observability/loki/loki.yaml:/etc/loki/loki.yaml:ro
+    tmpfs: ["/loki:mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    ports: ["127.0.0.1:3100:3100"]
+
+  grafana:
+    image: grafana/grafana:13.2.3@sha256:b28bae15e219c998fb0e0424ed724930cc61b1f61fb404d47c862f9a23f9e572
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-locally}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/gateway-slo.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+    tmpfs: ["/var/lib/grafana:mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on: [prometheus, tempo, loki]
+
+  # Load generator, only started on demand:
+  #   docker compose run --rm k6 run /scripts/baseline.js
+  k6:
+    image: grafana/k6:2.3.0@sha256:2dd4756ec6e14e62778916e1eb850108e4b499304c02df56760fa0bdb0fba0b8
+    profiles: [load]
+    environment:
+      BASE_URL: http://gateway:8080
+    volumes:
+      - ./loadtest:/scripts:ro
+      - ./loadtest/results:/results
+    depends_on:
+      gateway: {condition: service_healthy}

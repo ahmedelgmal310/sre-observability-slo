@@ -1,0 +1,38 @@
+global:
+  scrape_interval: 15s
+  # Rules are evaluated often so burn-rate alerts react within seconds of the
+  # threshold being crossed; the windows themselves come from the SLO math.
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # Service metrics arrive via OTLP and are exposed by the collector. The
+  # collector sets job=<service.name>, so keep the labels it provides.
+  - job_name: otel-collector
+    scrape_interval: 5s
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]

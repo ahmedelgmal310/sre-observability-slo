@@ -1,0 +1,155 @@
+# promtool test rules observability/prometheus/tests/slo-gateway.test.yml
+rule_files:
+  - ../rules/slo-gateway.yml
+
+evaluation_interval: 15s
+
+tests:
+  # 1. Healthy traffic: 0.1% errors, everything under 300ms -> no alerts and
+  #    80% of the availability budget left.
+  - name: healthy traffic does not page
+    interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{job="gateway", http_response_status_code="200"}'
+        values: '0+999x240'
+      - series: 'http_server_request_duration_seconds_count{job="gateway", http_response_status_code="503"}'
+        values: '0+1x240'
+      - series: 'http_server_request_duration_seconds_bucket{job="gateway", http_response_status_code="200", le="0.3"}'
+        values: '0+999x240'
+      - series: 'http_server_request_duration_seconds_bucket{job="gateway", http_response_status_code="503", le="0.3"}'
+        values: '0+1x240'
+    alert_rule_test:
+      - {alertname: GatewayAvailabilityFastBurn, eval_time: 3h, exp_alerts: []}
+      - {alertname: GatewayAvailabilitySlowBurn, eval_time: 3h, exp_alerts: []}
+      - {alertname: GatewayLatencyFastBurn, eval_time: 3h, exp_alerts: []}
+      - {alertname: GatewayLatencySlowBurn, eval_time: 3h, exp_alerts: []}
+    promql_expr_test:
+      - expr: (slo:sli_error:ratio_rate1h{slo="availability"} > bool 0.00099) * (slo:sli_error:ratio_rate1h{slo="availability"} < bool 0.00101)
+        eval_time: 3h
+        exp_samples:
+          - labels: '{service="gateway", slo="availability"}'
+            value: 1
+      - expr: (slo:error_budget_remaining:ratio{slo="availability"} > bool 0.79) * (slo:error_budget_remaining:ratio{slo="availability"} < bool 0.81)
+        eval_time: 3h
+        exp_samples:
+          - labels: '{service="gateway", slo="availability"}'
+            value: 1
+      - expr: slo:sli_error:ratio_rate5m{slo="latency"}
+        eval_time: 3h
+        exp_samples:
+          - labels: 'slo:sli_error:ratio_rate5m{service="gateway", slo="latency"}'
+            value: 0
+
+  # 2. Hard outage: 10% of requests fail (20x burn). The fast-burn alert must
+  #    page within minutes; the slow-burn alert follows after its longer "for".
+  - name: availability fast and slow burn
+    interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{job="gateway", http_response_status_code="200"}'
+        values: '0+90x60'
+      - series: 'http_server_request_duration_seconds_count{job="gateway", http_response_status_code="502"}'
+        values: '0+10x60'
+    alert_rule_test:
+      - alertname: GatewayAvailabilityFastBurn
+        eval_time: 4m
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              window: 1h/5m
+              service: gateway
+              slo: availability
+            exp_annotations:
+              summary: Gateway is burning its availability error budget 14.4x too fast
+              description: >-
+                10% of gateway requests failed with 5xx over the last
+                hour (objective 99.5%). At this rate 2% of the 30-day budget is gone every hour.
+              runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/gateway-availability.md
+              dashboard: http://localhost:3000/d/lighthouse-slo
+      - {alertname: GatewayAvailabilitySlowBurn, eval_time: 4m, exp_alerts: []}
+      - alertname: GatewayAvailabilitySlowBurn
+        eval_time: 10m
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              window: 6h/30m
+              service: gateway
+              slo: availability
+            exp_annotations:
+              summary: Gateway is burning its availability error budget 6x too fast
+              description: >-
+                10% of gateway requests failed with 5xx over the last
+                6 hours (objective 99.5%). At this rate 5% of the 30-day budget is gone every 6 hours.
+              runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/gateway-availability.md
+              dashboard: http://localhost:3000/d/lighthouse-slo
+      - {alertname: GatewayLatencyFastBurn, eval_time: 10m, exp_alerts: []}
+
+  # 3. Errors stop after 20 minutes. The 1h window still exceeds 14.4x, but the
+  #    5m confirmation window clears, so the page resolves quickly.
+  - name: fast burn resolves when the short window recovers
+    interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{job="gateway", http_response_status_code="200"}'
+        values: '0+90x60'
+      - series: 'http_server_request_duration_seconds_count{job="gateway", http_response_status_code="500"}'
+        values: '0+10x20 200+0x40'
+    alert_rule_test:
+      - alertname: GatewayAvailabilityFastBurn
+        eval_time: 15m
+        exp_alerts:
+          - exp_labels: {severity: page, window: 1h/5m, service: gateway, slo: availability}
+            exp_annotations:
+              summary: Gateway is burning its availability error budget 14.4x too fast
+              description: >-
+                10% of gateway requests failed with 5xx over the last
+                hour (objective 99.5%). At this rate 2% of the 30-day budget is gone every hour.
+              runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/gateway-availability.md
+              dashboard: http://localhost:3000/d/lighthouse-slo
+      - {alertname: GatewayAvailabilityFastBurn, eval_time: 26m, exp_alerts: []}
+    promql_expr_test:
+      # Long window is still above the 7.2% threshold when the page clears.
+      - expr: slo:sli_error:ratio_rate1h{slo="availability"} > bool 0.072
+        eval_time: 26m
+        exp_samples:
+          - labels: '{service="gateway", slo="availability"}'
+            value: 1
+
+  # 4. Latency regression: 80% of requests exceed 300ms (16x the 5% budget).
+  - name: latency fast burn
+    interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{job="gateway", http_response_status_code="200"}'
+        values: '0+100x60'
+      - series: 'http_server_request_duration_seconds_bucket{job="gateway", http_response_status_code="200", le="0.3"}'
+        values: '0+20x60'
+    alert_rule_test:
+      - alertname: GatewayLatencyFastBurn
+        eval_time: 4m
+        exp_alerts:
+          - exp_labels: {severity: page, window: 1h/5m, service: gateway, slo: latency}
+            exp_annotations:
+              summary: Gateway is burning its latency error budget 14.4x too fast
+              description: >-
+                80% of gateway requests took longer than 300ms over the
+                last hour (objective: 95% under 300ms).
+              runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/gateway-latency.md
+              dashboard: http://localhost:3000/d/lighthouse-slo
+      - {alertname: GatewayAvailabilityFastBurn, eval_time: 4m, exp_alerts: []}
+
+  # 5. Telemetry pipeline outage is surfaced as a ticket.
+  - name: collector down
+    interval: 1m
+    input_series:
+      - series: 'up{job="otel-collector", instance="otel-collector:8889"}'
+        values: '1 1 0x10'
+    alert_rule_test:
+      - {alertname: TelemetryPipelineDown, eval_time: 3m, exp_alerts: []}
+      - alertname: TelemetryPipelineDown
+        eval_time: 6m
+        exp_alerts:
+          - exp_labels: {severity: ticket, job: otel-collector, instance: "otel-collector:8889"}
+            exp_annotations:
+              summary: Prometheus cannot scrape the OpenTelemetry Collector
+              description: >-
+                SLO alerts are blind while service metrics are not flowing. Burn-rate alerts
+                cannot fire during this outage.
+              runbook_url: https://github.com/ahmedelgmal310/sre-observability-slo/blob/main/docs/runbooks/telemetry-pipeline.md

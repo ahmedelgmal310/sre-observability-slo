@@ -1,0 +1,52 @@
+# OpenTelemetry Collector: single OTLP entry point for all three signals.
+#   traces  -> Tempo (OTLP/HTTP)
+#   metrics -> Prometheus (scraped from :8889, OpenMetrics with exemplars)
+#   logs    -> Loki (native OTLP endpoint)
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 200
+    spike_limit_mib: 50
+  batch:
+    timeout: 1s
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # OpenMetrics is required for exemplars (metric -> trace links).
+    enable_open_metrics: true
+    without_scope_info: true
+    translation_strategy: UnderscoreEscapingWithSuffixes
+    metric_expiration: 10m
+  otlp_http/tempo:
+    endpoint: http://tempo:4318
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/loki]

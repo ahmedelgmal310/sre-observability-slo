@@ -1,0 +1,18 @@
+# Build and test output
+/bin/
+coverage.out
+*.test
+
+# Load test output (kept: .gitkeep)
+loadtest/results/*
+!loadtest/results/.gitkeep
+
+# Local env overrides
+.env
+
+# Editor / local tooling
+.idea/
+.vscode/
+.DS_Store
+.omc/
+.impeccable/
