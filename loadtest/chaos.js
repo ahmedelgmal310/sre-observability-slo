@@ -11,6 +11,7 @@ const TARGET = __ENV.CHAOS_TARGET || 'inventory';
 const BAGGAGE = { baggage: `chaos.target=${TARGET},chaos.error_rate=${ERROR_RATE}` };
 
 export const options = {
+  summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
   scenarios: {
     chaos: {
       executor: 'constant-arrival-rate',

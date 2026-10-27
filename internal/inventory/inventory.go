@@ -3,6 +3,7 @@ package inventory
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -59,8 +60,8 @@ func (s *Store) Get(sku string) (Stock, bool) {
 
 // Errors returned by Reserve.
 var (
-	ErrUnknownSKU   = fmt.Errorf("unknown sku")
-	ErrInsufficient = fmt.Errorf("insufficient stock")
+	ErrUnknownSKU   = errors.New("unknown sku")
+	ErrInsufficient = errors.New("insufficient stock")
 )
 
 // Reserve decrements stock atomically.
@@ -113,10 +114,10 @@ func (s *Service) reserve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.Store.Reserve(req.SKU, req.Qty)
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		httpx.WriteJSON(w, http.StatusOK, res)
-	case ErrUnknownSKU:
+	case errors.Is(err, ErrUnknownSKU):
 		httpx.WriteError(w, http.StatusNotFound, err.Error())
 	default:
 		s.Logger.WarnContext(r.Context(), "reservation rejected", slog.String("sku", req.SKU), slog.Int("qty", req.Qty))

@@ -73,11 +73,23 @@ total_logs=$(curl -fsS --get "${LOKI_URL}/loki/api/v1/query" \
   jq -r '.data.result[0].value[1] // "0"')
 record baseline_log_lines_10m "$total_logs"
 
+# ---- service graph (Tempo metrics generator -> Prometheus remote write) ------
+edges=$(promq 'count(traces_service_graph_request_total)')
+if [[ "$edges" != "NaN" ]]; then
+  log "service graph edges in Prometheus: ${edges}"
+  record service_graph_edges "$edges"
+else
+  log "WARN: no service graph metrics yet (Grafana service map will be empty)"
+fi
+
 # ---- grafana ----------------------------------------------------------------------
 auth=(-u "admin:${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set}")
+ds_healthy() {
+  [[ "$(curl -fsS "${auth[@]}" "${GRAFANA_URL}/api/datasources/uid/$1/health" | jq -r '.status')" == "OK" ]]
+}
 for ds in prometheus tempo loki; do
-  status=$(curl -fsS "${auth[@]}" "${GRAFANA_URL}/api/datasources/uid/${ds}/health" | jq -r '.status')
-  [[ "$status" == "OK" ]] || fail "Grafana datasource ${ds} health: ${status}"
+  retry 60 ds_healthy "$ds" ||
+    fail "Grafana datasource ${ds} unhealthy: $(curl -sS "${auth[@]}" "${GRAFANA_URL}/api/datasources/uid/${ds}/health")"
 done
 log "Grafana datasources prometheus, tempo, loki healthy"
 dashboards=$(curl -fsS "${auth[@]}" "${GRAFANA_URL}/api/search?type=dash-db" | jq -r '[.[].uid] | sort | join(",")')

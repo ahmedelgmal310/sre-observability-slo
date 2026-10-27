@@ -6,6 +6,7 @@ const RATE = parseInt(__ENV.RATE || '15', 10);
 const DURATION = __ENV.DURATION || '2m';
 
 export const options = {
+  summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
   scenarios: {
     baseline: {
       executor: 'constant-arrival-rate',

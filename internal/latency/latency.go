@@ -20,7 +20,7 @@ func (p Profile) Duration() time.Duration {
 	if p.Jitter <= 0 {
 		return max(p.Base, 0)
 	}
-	tail := time.Duration(rand.ExpFloat64() * float64(p.Jitter))
+	tail := time.Duration(rand.ExpFloat64() * float64(p.Jitter)) //nolint:gosec // simulated service time, not security sensitive
 	return max(p.Base, 0) + min(tail, 10*p.Jitter)
 }
 

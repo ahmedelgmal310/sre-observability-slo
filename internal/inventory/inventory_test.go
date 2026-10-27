@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -37,10 +38,10 @@ func TestStoreReserveIsAtomic(t *testing.T) {
 	if st, _ := s.Get("sku-1"); st.Available != 0 {
 		t.Fatalf("available = %d, want 0", st.Available)
 	}
-	if _, err := s.Reserve("sku-1", 1); err != ErrInsufficient {
+	if _, err := s.Reserve("sku-1", 1); !errors.Is(err, ErrInsufficient) {
 		t.Fatalf("err = %v", err)
 	}
-	if _, err := s.Reserve("nope", 1); err != ErrUnknownSKU {
+	if _, err := s.Reserve("nope", 1); !errors.Is(err, ErrUnknownSKU) {
 		t.Fatalf("err = %v", err)
 	}
 }
